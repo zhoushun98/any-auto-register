@@ -421,3 +421,22 @@ def build_sentinel_token(session, device_id, flow="authorize_continue", user_age
         "id": device_id,
         "flow": flow,
     }, separators=(",", ":"))
+
+
+def build_sentinel_token_vm_only(
+    session,
+    device_id,
+    flow="authorize_continue",
+    user_agent=None,
+    sec_ch_ua=None,
+    impersonate=None,
+):
+    """仅使用 VM 链路生成 sentinel token（不回退 PoW）。"""
+    return _build_sentinel_token_via_vm(
+        session,
+        device_id,
+        flow=flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        impersonate=impersonate,
+    )

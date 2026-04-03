@@ -328,23 +328,23 @@ class RegistrationEngineFlowTests(unittest.TestCase):
         mock_pow_token.assert_not_called()
 
     @mock.patch(
-        "platforms.chatgpt.refresh_token_registration_engine.build_sentinel_token",
-        return_value='{"source":"pow"}',
+        "platforms.chatgpt.refresh_token_registration_engine.build_sentinel_token_vm_only",
+        return_value='{"source":"vm"}',
     )
     @mock.patch(
         "platforms.chatgpt.refresh_token_registration_engine.get_sentinel_token_via_browser",
         return_value=None,
     )
-    def test_check_sentinel_falls_back_to_pow_when_browser_token_missing(
-        self, mock_browser_token, mock_pow_token
+    def test_check_sentinel_falls_back_to_vm_when_browser_token_missing(
+        self, mock_browser_token, mock_vm_token
     ):
         engine = self._make_engine()
         engine.session = mock.Mock()
 
         token = engine._check_sentinel("device-fixed", flow="oauth_create_account")
-        self.assertEqual(token, '{"source":"pow"}')
+        self.assertEqual(token, '{"source":"vm"}')
         mock_browser_token.assert_called_once()
-        mock_pow_token.assert_called_once_with(
+        mock_vm_token.assert_called_once_with(
             engine.session, "device-fixed", flow="oauth_create_account"
         )
 

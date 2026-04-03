@@ -19,7 +19,7 @@ from core.task_runtime import TaskInterruption
 from .oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient
 from .sentinel_browser import get_sentinel_token_via_browser
-from .sentinel_token import build_sentinel_token
+from .sentinel_token import build_sentinel_token, build_sentinel_token_vm_only
 from .utils import (
     generate_datadog_trace,
     generate_device_id,
@@ -349,6 +349,14 @@ class RefreshTokenRegistrationEngine:
                 if browser_token:
                     self._log(f"Sentinel Browser token 获取成功 ({flow})")
                     return browser_token
+                self._log(f"Sentinel Browser token 获取失败，尝试 VM ({flow})", "warning")
+                vm_token = build_sentinel_token_vm_only(self.session, did, flow=flow)
+                if vm_token:
+                    self._log(f"Sentinel VM token 获取成功 ({flow})")
+                    return vm_token
+                self._log(f"Sentinel VM token 获取失败 ({flow})", "warning")
+                return None
+
             sen_token = build_sentinel_token(self.session, did, flow=flow)
             if sen_token:
                 self._log(f"Sentinel token 获取成功 ({flow})")
