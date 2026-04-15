@@ -145,6 +145,14 @@ class BaseMailbox(ABC):
     def get_current_ids(self, account: MailboxAccount) -> set:
         """返回当前邮件 ID 集合（用于过滤旧邮件）"""
         ...
+
+    def cleanup(self, account: MailboxAccount) -> None:
+        """注册完成后清理指定邮箱账号（可选覆盖）。Yahoo 邮箱用于删除 DEA 别名。"""
+        pass
+
+    def cleanup_pending(self) -> None:
+        """注册完成后清理本轮所有待处理资源（可选覆盖）。由任务运行时在 finally 中调用。"""
+        pass
     def _yyds_safe_extract(self, text: str, pattern: str = None) -> Optional[str]:
         """通用验证码提取逻辑：若有捕获组则返回 group(1)，否则返回 group(0)"""
         import re
@@ -338,6 +346,22 @@ def create_mailbox(
             token_endpoint=extra.get("outlook_token_endpoint", ""),
             backend=extra.get("outlook_backend", ""),
             graph_api_base=extra.get("outlook_graph_api_base", ""),
+            proxy=proxy,
+        )
+    elif provider == "yahoo":
+        nickname_len = 10
+        otp_timeout = 60
+        try:
+            nickname_len = int(extra.get("yahoo_nickname_length", 10))
+        except (TypeError, ValueError):
+            pass
+        try:
+            otp_timeout = int(extra.get("yahoo_otp_timeout", 60))
+        except (TypeError, ValueError):
+            pass
+        return YahooMailbox(
+            nickname_length=nickname_len,
+            otp_timeout=otp_timeout,
             proxy=proxy,
         )
     else:  # laoudo
@@ -4406,3 +4430,608 @@ class FreemailMailbox(BaseMailbox):
             poll_interval=3,
             poll_once=poll_once,
         )
+
+
+# ---------------------------------------------------------------------------
+#  Yahoo 邮箱（DEA 别名模式）
+# ---------------------------------------------------------------------------
+
+class _YahooSessionInvalidError(RuntimeError):
+    """Yahoo 会话失效"""
+
+
+class _YahooAccount:
+    """单个 Yahoo 邮箱账号封装：Batch API + IMAP 轮询"""
+
+    _BATCH_URL = "https://mail.yahoo.com/ws/v3/batch"
+    _APP_ID = "YMailNorrin"
+    _UA = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    _IMAP_HOST = "imap.mail.yahoo.com"
+    _IMAP_PORT = 993
+
+    def __init__(self, db_id: int, email: str, app_password: str, session_data: str):
+        self.db_id = db_id
+        self.email = email
+        self.app_password = app_password
+        self._session: Optional[dict] = None
+        self._parse_session(session_data)
+
+        # DEA
+        self._dea_prefix: Optional[str] = None
+        self._dea_domain: str = "yahoo.com"
+        self.api_lock = threading.Lock()
+
+        # IMAP 轮询
+        self._poller_started = False
+        self._poller_lock = threading.Lock()
+        self.otp_codes: dict[str, str] = {}
+        self.otp_events: dict[str, threading.Event] = {}
+        self.otp_wait_since: dict[str, float] = {}
+        self.otp_lock = threading.Lock()
+        self.otp_seen_uids: set[str] = set()
+
+        # 可用性
+        self._available = True
+        self._unavailable_reason = ""
+        self._status_lock = threading.Lock()
+
+    # -- Session --
+
+    def _parse_session(self, session_data: str) -> None:
+        if not session_data:
+            return
+        try:
+            payload = json.loads(session_data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if isinstance(payload, dict) and payload.get("wssid") and payload.get("mailbox_id"):
+            self._session = payload
+
+    def load_session(self) -> dict:
+        if not self.is_available():
+            raise _YahooSessionInvalidError(f"Yahoo 账号不可用: {self._unavailable_reason}")
+        if self._session:
+            return self._session
+        raise _YahooSessionInvalidError(f"Yahoo 账号 {self.email} 缺少有效 session")
+
+    # -- 可用性 --
+
+    def is_available(self) -> bool:
+        with self._status_lock:
+            return self._available
+
+    def mark_unavailable(self, reason: str) -> bool:
+        with self._status_lock:
+            was = self._available
+            self._available = False
+            if reason and (was or not self._unavailable_reason):
+                self._unavailable_reason = str(reason)
+        self._session = None
+        return was
+
+    # -- Batch API 工具 --
+
+    def _mailbox_uri(self) -> str:
+        session = self.load_session()
+        return f"/ws/v3/mailboxes/@.id=={session['mailbox_id']}"
+
+    def _batch(self, batch_json: dict, name: str = "api") -> dict:
+        import uuid
+        import httpx
+
+        session = self.load_session()
+        boundary = f"----PythonBoundary{uuid.uuid4().hex[:16]}"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="batchJson"\r\n'
+            f"\r\n"
+            f"{json.dumps(batch_json, separators=(',', ':'))}\r\n"
+            f"--{boundary}--\r\n"
+        )
+        resp = httpx.post(
+            self._BATCH_URL,
+            params={
+                "name": name,
+                "appId": self._APP_ID,
+                "ymreqid": str(uuid.uuid4()),
+                "wssid": session["wssid"],
+            },
+            headers={
+                "Accept": "application/json",
+                "Origin": "https://mail.yahoo.com",
+                "Referer": "https://mail.yahoo.com/",
+                "User-Agent": self._UA,
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            cookies=session.get("cookies") or {},
+            content=body,
+            follow_redirects=False,
+            timeout=15,
+        )
+        if resp.status_code in (301, 302, 303, 307, 308, 401, 403):
+            raise _YahooSessionInvalidError(
+                f"Yahoo session 失效 (HTTP {resp.status_code})，请重新登录获取 session"
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Yahoo Batch API 错误: HTTP {resp.status_code}")
+        payload = resp.json()
+        for item in payload.get("result", {}).get("responses", []):
+            if isinstance(item, dict) and item.get("httpCode") in (401, 403):
+                raise _YahooSessionInvalidError(
+                    f"Yahoo session 在 batch 响应中失效: httpCode {item.get('httpCode')}"
+                )
+        return payload
+
+    # -- DEA 操作 --
+
+    def fetch_dea_prefix(self) -> tuple[str, str]:
+        if self._dea_prefix:
+            return self._dea_prefix, self._dea_domain
+        batch = {
+            "requests": [{
+                "id": "GetPrefix",
+                "uri": f"{self._mailbox_uri()}/attributes/@.id==disposableAddressesPrefix",
+                "method": "GET",
+            }],
+            "responseType": "json",
+        }
+        result = self._batch(batch, "settings.get")
+        for item in result.get("result", {}).get("responses", []):
+            if item.get("id") != "GetPrefix":
+                continue
+            if item.get("httpCode") != 200:
+                raise RuntimeError(f"获取 Yahoo DEA 前缀失败: httpCode {item.get('httpCode')}")
+            value = ((item.get("response") or {}).get("result") or {}).get("value") or {}
+            prefix = str(value.get("deaPrefix") or "").strip()
+            domain = str(value.get("deaDomain") or "yahoo.com").strip() or "yahoo.com"
+            if not prefix:
+                raise RuntimeError("Yahoo DEA 前缀为空")
+            self._dea_prefix = prefix
+            self._dea_domain = domain
+            return prefix, domain
+        raise RuntimeError("获取 Yahoo DEA 前缀失败: 无有效响应")
+
+    def add_nickname(self, suffix: str) -> dict:
+        prefix, domain = self.fetch_dea_prefix()
+        dea_email = f"{prefix}-{suffix}@{domain}"
+        batch = {
+            "requests": [{
+                "id": "AddAccount",
+                "uri": f"{self._mailbox_uri()}/accounts",
+                "method": "POST",
+                "payload": {"account": {"type": "DEA", "email": dea_email}},
+            }],
+            "responseType": "json",
+        }
+        result = self._batch(batch, "settings.addAccount")
+        for r in result.get("result", {}).get("responses", []):
+            if r.get("id") == "AddAccount" and r.get("httpCode") == 200:
+                return r["response"]["result"]
+        raise RuntimeError(f"创建 Yahoo 别名失败: {dea_email}")
+
+    def delete_nickname(self, account_id: str) -> None:
+        batch = {
+            "requests": [{
+                "id": "deleteAccount",
+                "uri": f"{self._mailbox_uri()}/accounts/@.id=={account_id}",
+                "method": "DELETE",
+            }],
+            "responseType": "json",
+        }
+        self._batch(batch, "settings.deleteAccount")
+
+    def cleanup_all_nicknames(self) -> None:
+        batch = {
+            "requests": [{
+                "id": "GetAccounts",
+                "uri": f"{self._mailbox_uri()}/accounts",
+                "method": "GET",
+            }],
+            "responseType": "json",
+        }
+        result = self._batch(batch, "settings.get")
+        dea_accounts = []
+        for r in result.get("result", {}).get("responses", []):
+            if r.get("id") == "GetAccounts" and r.get("httpCode") == 200:
+                for a in r["response"]["result"].get("accounts", []):
+                    if a.get("type") == "DEA" and a.get("status") == "ENABLED":
+                        dea_accounts.append(a)
+        if not dea_accounts:
+            return
+        delete_requests = [
+            {
+                "id": f"del_{a['id']}",
+                "uri": f"{self._mailbox_uri()}/accounts/@.id=={a['id']}",
+                "method": "DELETE",
+            }
+            for a in dea_accounts
+        ]
+        self._batch({"requests": delete_requests, "responseType": "json"}, "settings.deleteAccount")
+
+    # -- IMAP 轮询 --
+
+    def start_poller(self) -> None:
+        with self._poller_lock:
+            if self._poller_started:
+                return
+            self._poller_started = True
+        t = threading.Thread(
+            target=self._imap_poller_loop, daemon=True, name=f"yahoo-imap-{self.email}"
+        )
+        t.start()
+
+    def _imap_poller_loop(self) -> None:
+        import imaplib
+        import email as email_mod
+        import re as _re
+
+        imap = None
+        last_uidvalidity = None
+
+        while True:
+            with self.otp_lock:
+                has_waiters = bool(self.otp_events)
+            if not has_waiters:
+                time.sleep(5)
+                continue
+
+            try:
+                if imap is None:
+                    for attempt in range(5):
+                        try:
+                            imap = imaplib.IMAP4_SSL(self._IMAP_HOST, self._IMAP_PORT)
+                            imap.login(self.email, self.app_password)
+                            break
+                        except Exception:
+                            if attempt < 4:
+                                time.sleep(3 * (attempt + 1))
+                            else:
+                                raise
+
+                imap.select("INBOX")
+                # UIDVALIDITY 检查
+                try:
+                    _uidv_resp = imap.response("UIDVALIDITY")
+                    _uidv = _uidv_resp[1][0].decode() if (_uidv_resp[1] and _uidv_resp[1][0]) else ""
+                    if _uidv and last_uidvalidity is not None and _uidv != last_uidvalidity:
+                        self.otp_seen_uids.clear()
+                    if _uidv:
+                        last_uidvalidity = _uidv
+                except Exception:
+                    pass
+
+                status, data = imap.uid("search", None, "UNSEEN")
+                if status != "OK" or not data[0]:
+                    time.sleep(1)
+                    continue
+
+                all_uids = data[0].split()
+                new_uids = [u for u in all_uids if u.decode() not in self.otp_seen_uids]
+                if not new_uids:
+                    time.sleep(1)
+                    continue
+
+                uid_set = b",".join(new_uids)
+                status2, msg_data = imap.uid("fetch", uid_set, "(RFC822)")
+                if status2 != "OK" or not msg_data:
+                    time.sleep(1)
+                    continue
+
+                uids_to_delete = []
+                for item in msg_data:
+                    if not isinstance(item, tuple) or len(item) < 2:
+                        continue
+                    uid_match = _re.search(rb"UID (\d+)", item[0])
+                    if not uid_match:
+                        continue
+                    uid_str = uid_match.group(1).decode()
+                    self.otp_seen_uids.add(uid_str)
+
+                    msg = email_mod.message_from_bytes(item[1])
+                    to_addr = self._extract_to(msg)
+                    body = self._get_text(msg)
+                    subject = self._decode_header(msg.get("Subject", ""))
+                    code = self._extract_code(subject + "\n" + body)
+
+                    # 解析发送时间
+                    msg_ts = 0.0
+                    date_str = msg.get("Date", "")
+                    if date_str:
+                        try:
+                            msg_ts = email_mod.utils.parsedate_to_datetime(date_str).timestamp()
+                        except Exception:
+                            pass
+
+                    if code and to_addr:
+                        with self.otp_lock:
+                            wait_since = self.otp_wait_since.get(to_addr, 0)
+                            is_fresh = (msg_ts <= 0) or (msg_ts >= wait_since - 30)
+
+                            evt = self.otp_events.get(to_addr)
+                            if evt and is_fresh:
+                                self.otp_codes[to_addr] = code
+                                evt.set()
+                            elif not evt:
+                                # 模糊匹配
+                                for wait_email, wait_evt in self.otp_events.items():
+                                    if wait_email in to_addr or to_addr in wait_email:
+                                        ws = self.otp_wait_since.get(wait_email, 0)
+                                        if (msg_ts <= 0) or (msg_ts >= ws - 30):
+                                            self.otp_codes[wait_email] = code
+                                            wait_evt.set()
+                                            break
+                                else:
+                                    if is_fresh:
+                                        self.otp_codes[to_addr] = code
+
+                        uids_to_delete.append(uid_match.group(1))
+
+                for uid_val in uids_to_delete:
+                    try:
+                        imap.uid("store", uid_val, "+FLAGS", "\\Deleted")
+                    except Exception:
+                        pass
+                try:
+                    imap.expunge()
+                except Exception:
+                    pass
+
+            except (Exception,) as exc:
+                if imap:
+                    try:
+                        imap.logout()
+                    except Exception:
+                        pass
+                imap = None
+                # 判断是否为认证失败
+                err_str = str(exc)
+                if "LOGIN" in err_str.upper() or "AUTH" in err_str.upper():
+                    self.mark_unavailable(f"IMAP 认证失败: {err_str}")
+                    return
+                time.sleep(3)
+
+            time.sleep(1)
+
+    # -- IMAP 邮件解析工具 --
+
+    @staticmethod
+    def _extract_to(msg) -> str:
+        import re as _re
+        to_raw = msg.get("To", "")
+        m = _re.search(r'[\w.+-]+@[\w.-]+', to_raw)
+        return m.group(0).lower() if m else ""
+
+    @staticmethod
+    def _decode_header(header_val: str) -> str:
+        from email.header import decode_header
+        if not header_val:
+            return ""
+        parts = decode_header(header_val)
+        decoded = []
+        for data, charset in parts:
+            if isinstance(data, bytes):
+                decoded.append(data.decode(charset or "utf-8", errors="replace"))
+            else:
+                decoded.append(data)
+        return "".join(decoded)
+
+    @staticmethod
+    def _get_text(msg) -> str:
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct in ("text/plain", "text/html"):
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        return payload.decode(charset, errors="replace")
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                return payload.decode(charset, errors="replace")
+        return ""
+
+    @staticmethod
+    def _extract_code(content: str) -> str:
+        import re as _re
+        if not content:
+            return ""
+        patterns = [
+            r"(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|"
+            r"login\s+code|验证码|校验码|code)[^0-9]{0,30}(\d{6})",
+            r"(?<!\d)(\d{6})(?!\d)",
+        ]
+        for p in patterns:
+            m = _re.search(p, content, _re.IGNORECASE | _re.DOTALL)
+            if m:
+                return m.group(1)
+        return ""
+
+
+class YahooMailbox(BaseMailbox):
+    """Yahoo 邮箱（DEA 别名模式）：通过 Batch API 创建一次性别名，IMAP 轮询收验证码"""
+
+    _accounts: list[_YahooAccount] = []
+    _accounts_loaded = False
+    _cursor = 0
+    _pool_lock = threading.Lock()
+
+    def __init__(self, nickname_length: int = 10, otp_timeout: int = 60, proxy: str = None):
+        self._proxy = build_requests_proxy_config(proxy)
+        self._nickname_length = nickname_length
+        self._otp_timeout = otp_timeout
+        self._local_pending: list[tuple[_YahooAccount, str, str]] = []
+        if not YahooMailbox._accounts_loaded:
+            self._load_accounts()
+
+    def _load_accounts(self) -> None:
+        with YahooMailbox._pool_lock:
+            if YahooMailbox._accounts_loaded:
+                return
+            try:
+                from sqlmodel import Session, select
+                from core.db import engine, YahooAccountModel
+
+                with Session(engine) as session:
+                    rows = session.exec(
+                        select(YahooAccountModel).where(YahooAccountModel.enabled == True)
+                    ).all()
+                accounts = []
+                for row in rows:
+                    acct = _YahooAccount(
+                        db_id=row.id,
+                        email=row.email,
+                        app_password=row.app_password,
+                        session_data=row.session_data,
+                    )
+                    if acct._session is None:
+                        continue
+                    # 验证 session 并清理遗留别名
+                    try:
+                        acct.fetch_dea_prefix()
+                        acct.cleanup_all_nicknames()
+                        accounts.append(acct)
+                    except _YahooSessionInvalidError as e:
+                        acct.mark_unavailable(str(e))
+                    except Exception:
+                        accounts.append(acct)
+                YahooMailbox._accounts = accounts
+            finally:
+                YahooMailbox._accounts_loaded = True
+
+    def _get_account(self) -> _YahooAccount:
+        with YahooMailbox._pool_lock:
+            active = [a for a in YahooMailbox._accounts if a.is_available()]
+            if not active:
+                raise RuntimeError("Yahoo 邮箱账号池为空，请先在设置页导入 Yahoo 账号")
+            acct = active[YahooMailbox._cursor % len(active)]
+            YahooMailbox._cursor += 1
+            return acct
+
+    def get_email(self) -> MailboxAccount:
+        acct = self._get_account()
+        suffix = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=self._nickname_length))
+        try:
+            with acct.api_lock:
+                result = acct.add_nickname(suffix)
+        except _YahooSessionInvalidError as e:
+            acct.mark_unavailable(str(e))
+            self._log(f"[Yahoo] 账号 {acct.email} session 失效: {e}")
+            raise RuntimeError(f"Yahoo 账号 {acct.email} session 失效") from e
+
+        dea_email = result.get("email", "")
+        account_id = result.get("id", "")
+        self._log(f"[Yahoo] 创建别名: {dea_email} (主账号: {acct.email})")
+
+        # 记录待清理
+        self._local_pending.append((acct, account_id, dea_email))
+
+        return MailboxAccount(
+            email=dea_email,
+            account_id=account_id,
+            extra={
+                "provider": "yahoo",
+                "yahoo_account_email": acct.email,
+                "yahoo_db_id": acct.db_id,
+            },
+        )
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        extra = getattr(account, "extra", None) or {}
+        yahoo_email = extra.get("yahoo_account_email", "")
+        acct = self._find_account(yahoo_email)
+        if not acct:
+            raise RuntimeError(f"未找到 Yahoo 主账号: {yahoo_email}")
+
+        acct.start_poller()
+        email_lower = account.email.lower()
+        wait_timeout = timeout or self._otp_timeout
+
+        self._log(f"[Yahoo] 等待验证码: {account.email} (超时 {wait_timeout}s)")
+
+        # 检查是否已有缓存
+        with acct.otp_lock:
+            code = acct.otp_codes.pop(email_lower, "")
+            if code:
+                self._log(f"[Yahoo] 验证码已就绪: {code}")
+                return code
+            event = threading.Event()
+            acct.otp_events[email_lower] = event
+            acct.otp_wait_since[email_lower] = time.time()
+
+        try:
+            deadline = time.monotonic() + wait_timeout
+            while time.monotonic() < deadline:
+                self._checkpoint()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if event.wait(timeout=min(1.0, remaining)):
+                    with acct.otp_lock:
+                        code = acct.otp_codes.pop(email_lower, "")
+                    if code:
+                        self._log(f"[Yahoo] 收到验证码: {code}")
+                        return code
+
+            # 超时
+            with acct.otp_lock:
+                code = acct.otp_codes.pop(email_lower, "")
+            if code:
+                self._log(f"[Yahoo] 收到验证码: {code}")
+                return code
+
+            raise TimeoutError(f"Yahoo 等待验证码超时 ({wait_timeout}s): {account.email}")
+        finally:
+            with acct.otp_lock:
+                acct.otp_events.pop(email_lower, None)
+                acct.otp_wait_since.pop(email_lower, None)
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        return set()
+
+    def cleanup(self, account: MailboxAccount) -> None:
+        extra = getattr(account, "extra", None) or {}
+        yahoo_email = extra.get("yahoo_account_email", "")
+        acct = self._find_account(yahoo_email)
+        if not acct or not account.account_id:
+            return
+        try:
+            with acct.api_lock:
+                acct.delete_nickname(account.account_id)
+            self._log(f"[Yahoo] 已删除别名: {account.email}")
+        except _YahooSessionInvalidError as e:
+            acct.mark_unavailable(str(e))
+        except Exception as e:
+            self._log(f"[Yahoo] 删除别名失败 {account.email}: {e}")
+
+    def cleanup_pending(self) -> None:
+        for acct, account_id, dea_email in self._local_pending:
+            if not account_id:
+                continue
+            try:
+                with acct.api_lock:
+                    acct.delete_nickname(account_id)
+                self._log(f"[Yahoo] 已删除别名: {dea_email}")
+            except _YahooSessionInvalidError as e:
+                acct.mark_unavailable(str(e))
+            except Exception as e:
+                self._log(f"[Yahoo] 删除别名失败 {dea_email}: {e}")
+        self._local_pending.clear()
+
+    def _find_account(self, yahoo_email: str) -> Optional[_YahooAccount]:
+        for acct in YahooMailbox._accounts:
+            if acct.email == yahoo_email:
+                return acct
+        return None

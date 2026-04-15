@@ -37,6 +37,7 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'OpenTrashMail', value: 'opentrashmail' },
     { label: 'Freemail（自建 CF Worker）', value: 'freemail' },
     { label: 'CF Worker（自建域名）', value: 'cfworker' },
+    { label: 'Yahoo（DEA 别名模式）', value: 'yahoo' },
   ],
   maliapi_auto_domain_strategy: [
     { label: 'balanced', value: 'balanced' },
@@ -236,6 +237,14 @@ const TAB_ITEMS = [
           { key: 'luckmail_api_key', label: 'API Key', secret: true },
           { key: 'luckmail_email_type', label: '邮箱类型（可选）', type: 'select' },
           { key: 'luckmail_domain', label: '邮箱域名（可选）', placeholder: 'outlook.com / gmail.com' },
+        ],
+      },
+      {
+        title: 'Yahoo 邮箱',
+        desc: '通过 DEA（一次性邮箱地址）机制生成别名，需要导入 Yahoo 主账号的应用专用密码和 session',
+        fields: [
+          { key: 'yahoo_nickname_length', label: '别名后缀长度', placeholder: '10' },
+          { key: 'yahoo_otp_timeout', label: 'OTP 超时秒数', placeholder: '60' },
         ],
       },
     ],

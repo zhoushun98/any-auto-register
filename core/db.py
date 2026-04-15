@@ -87,6 +87,19 @@ class OutlookAccountModel(SQLModel, table=True):
     last_used: Optional[datetime] = None
 
 
+class YahooAccountModel(SQLModel, table=True):
+    __tablename__ = "yahoo_accounts"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True, sa_column_kwargs={"unique": True})
+    app_password: str
+    session_data: str = ""
+    enabled: bool = True
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    last_used: Optional[datetime] = None
+
+
 class ProxyModel(SQLModel, table=True):
     __tablename__ = "proxies"
 

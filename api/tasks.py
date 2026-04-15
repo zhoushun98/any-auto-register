@@ -452,6 +452,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             _proxy = None
             current_email = req.email or ""
             attempt_id: int | None = None
+            _mailbox = None
+            _platform = None
             try:
                 control.checkpoint()
                 attempt_id = control.start_attempt()
@@ -578,6 +580,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 return AttemptResult.failed(str(e))
             finally:
                 control.finish_attempt(attempt_id)
+                if _mailbox is not None:
+                    try:
+                        _mailbox.cleanup_pending()
+                    except Exception:
+                        pass
 
         from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 

@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-MailImportProviderType = Literal["applemail", "microsoft"]
+MailImportProviderType = Literal["applemail", "microsoft", "yahoo"]
 MailImportAccountType = Literal["microsoft_oauth", "mailapi_url"]
 
 DEFAULT_PREVIEW_LIMIT = 100

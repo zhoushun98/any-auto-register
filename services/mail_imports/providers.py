@@ -14,7 +14,7 @@ from core.applemail_pool import (
     save_applemail_pool_json,
 )
 from core.config_store import config_store
-from core.db import OutlookAccountModel, engine
+from core.db import OutlookAccountModel, YahooAccountModel, engine
 
 from .base import BaseMailImportStrategy
 from .microsoft_import_rules import (
@@ -635,6 +635,203 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
         )
         return MailImportResponse(
             type="microsoft",
+            summary=MailImportSummary(
+                total=len(targets),
+                success=len(deleted),
+                failed=len(errors),
+            ),
+            snapshot=snapshot,
+            errors=errors,
+            meta={"deleted_emails": deleted},
+        )
+
+
+class YahooMailImportStrategy(BaseMailImportStrategy):
+    """Yahoo 邮箱导入策略"""
+
+    @property
+    def descriptor(self) -> MailImportProviderDescriptor:
+        return MailImportProviderDescriptor(
+            type="yahoo",
+            label="Yahoo 邮箱（DEA 别名模式）",
+            description=(
+                "导入 Yahoo 邮箱主账号，通过 DEA（Disposable Email Address）机制"
+                "为每次注册生成一次性别名邮箱。需要应用专用密码和 Yahoo Mail session 数据。"
+            ),
+            helper_text=(
+                "每行一个账号，格式：邮箱----应用专用密码----session_json_base64\n"
+                "session 数据为 base64 编码的 JSON，包含 wssid、mailbox_id、cookies 字段。\n"
+                "也可先只导入 邮箱----应用专用密码，后续再补充 session。"
+            ),
+            content_placeholder=(
+                "user@yahoo.com----abcdefghijkl----eyJ3c3NpZCI6Ii4uLiIsIm1haWxib3hfaWQiOiIuLi4iLCJjb29raWVzIjp7fX0="
+            ),
+            preview_empty_text="当前还没有已导入的 Yahoo 邮箱账号。",
+        )
+
+    def get_snapshot(self, request: MailImportSnapshotRequest) -> MailImportSnapshot:
+        with Session(engine) as session:
+            accounts = session.exec(
+                select(YahooAccountModel).order_by(YahooAccountModel.id)
+            ).all()
+
+        limit = max(int(request.preview_limit or 0), 0)
+        preview = accounts[:limit] if limit else []
+        items = [
+            MailImportSnapshotItem(
+                index=idx,
+                email=account.email,
+                enabled=bool(account.enabled),
+            )
+            for idx, account in enumerate(preview, start=1)
+        ]
+        return MailImportSnapshot(
+            type="yahoo",
+            label=self.descriptor.label,
+            count=len(accounts),
+            items=items,
+            truncated=len(accounts) > limit if limit > 0 else len(accounts) > 0,
+        )
+
+    def execute(self, request: MailImportExecuteRequest) -> MailImportResponse:
+        from .yahoo_import_rules import (
+            YahooRowParser,
+            YahooMailImportRuleEngine,
+        )
+
+        lines = (request.content or "").splitlines()
+        actionable = [
+            (idx, line.strip())
+            for idx, line in enumerate(lines, start=1)
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+        with Session(engine) as session:
+            existing_emails = {
+                str(e or "").strip()
+                for e in session.exec(select(YahooAccountModel.email)).all()
+            }
+
+        parser = YahooRowParser()
+        rule_engine = YahooMailImportRuleEngine()
+
+        success = 0
+        failed = 0
+        errors: list[str] = []
+        accounts: list[dict] = []
+        batch_seen: set[str] = set()
+
+        for line_number, line in actionable:
+            try:
+                record = parser.parse(line_number, line)
+            except ValueError as exc:
+                errors.append(str(exc))
+                failed += 1
+                continue
+
+            if record.email in batch_seen:
+                errors.append(f"行 {line_number}: 导入内容存在重复邮箱: {record.email}")
+                failed += 1
+                continue
+            batch_seen.add(record.email)
+
+            result = rule_engine.evaluate(record, {"existing_emails": existing_emails})
+            if not result.get("ok"):
+                errors.append(str(result.get("message")))
+                failed += 1
+                continue
+
+            with Session(engine) as session:
+                try:
+                    account = YahooAccountModel(
+                        email=record.email,
+                        app_password=record.app_password,
+                        session_data=record.session_data,
+                        enabled=bool(request.enabled),
+                        created_at=_utcnow(),
+                        updated_at=_utcnow(),
+                    )
+                    session.add(account)
+                    session.commit()
+                    session.refresh(account)
+                    existing_emails.add(record.email)
+                    accounts.append({
+                        "id": account.id,
+                        "email": account.email,
+                        "has_session": bool(account.session_data),
+                        "enabled": account.enabled,
+                    })
+                    success += 1
+                except Exception as exc:
+                    session.rollback()
+                    failed += 1
+                    errors.append(f"行 {line_number}: 创建失败: {str(exc)}")
+
+        snapshot = self.get_snapshot(
+            MailImportSnapshotRequest(
+                type="yahoo",
+                preview_limit=request.preview_limit,
+            )
+        )
+        return MailImportResponse(
+            type="yahoo",
+            summary=MailImportSummary(total=success + failed, success=success, failed=failed),
+            snapshot=snapshot,
+            errors=errors,
+            meta={"accounts": accounts},
+        )
+
+    def delete(self, request: MailImportDeleteRequest) -> MailImportResponse:
+        email = str(request.email or "").strip()
+        if not email:
+            raise RuntimeError("缺少要删除的邮箱地址")
+
+        with Session(engine) as session:
+            account = session.exec(
+                select(YahooAccountModel).where(YahooAccountModel.email == email)
+            ).first()
+            if not account:
+                raise RuntimeError(f"未找到要删除的 Yahoo 邮箱: {email}")
+            session.delete(account)
+            session.commit()
+
+        snapshot = self.get_snapshot(
+            MailImportSnapshotRequest(
+                type="yahoo",
+                preview_limit=request.preview_limit,
+            )
+        )
+        return MailImportResponse(
+            type="yahoo",
+            summary=MailImportSummary(total=1, success=1, failed=0),
+            snapshot=snapshot,
+        )
+
+    def batch_delete(self, request: MailImportBatchDeleteRequest) -> MailImportResponse:
+        targets = [str(item.email or "").strip() for item in (request.items or []) if str(item.email or "").strip()]
+        deleted: list[str] = []
+        errors: list[str] = []
+
+        with Session(engine) as session:
+            for email in targets:
+                account = session.exec(
+                    select(YahooAccountModel).where(YahooAccountModel.email == email)
+                ).first()
+                if account:
+                    session.delete(account)
+                    deleted.append(email)
+                else:
+                    errors.append(f"未找到: {email}")
+            session.commit()
+
+        snapshot = self.get_snapshot(
+            MailImportSnapshotRequest(
+                type="yahoo",
+                preview_limit=request.preview_limit,
+            )
+        )
+        return MailImportResponse(
+            type="yahoo",
             summary=MailImportSummary(
                 total=len(targets),
                 success=len(deleted),

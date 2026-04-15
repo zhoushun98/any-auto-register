@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
-import { App, Alert, Button, Card, Form, Input, InputNumber, Popconfirm, Select, Space, Switch, Table, Tag, Typography } from 'antd'
+import { App, Alert, Button, Card, Form, Input, InputNumber, Popconfirm, Select, Space, Switch, Table, Tag, Typography, Upload } from 'antd'
+import { UploadOutlined } from '@ant-design/icons'
 import type { FormInstance } from 'antd'
 
 import { apiFetch } from '@/lib/utils'
 
-type MailImportProviderType = 'applemail' | 'microsoft'
+type MailImportProviderType = 'applemail' | 'microsoft' | 'yahoo'
 type MailImportSelectionType = MailImportProviderType | 'outlook' | 'hotmail' | 'mailapi'
 type MailImportFormProviderType = MailImportProviderType | 'mail_import'
 
@@ -63,8 +64,8 @@ interface MailImportResult {
   meta: Record<string, unknown>
 }
 
-const SUPPORTED_IMPORT_TYPES: MailImportProviderType[] = ['applemail', 'microsoft']
-const SUPPORTED_SELECTION_TYPES: MailImportSelectionType[] = ['applemail', 'microsoft', 'outlook', 'hotmail', 'mailapi']
+const SUPPORTED_IMPORT_TYPES: MailImportProviderType[] = ['applemail', 'microsoft', 'yahoo']
+const SUPPORTED_SELECTION_TYPES: MailImportSelectionType[] = ['applemail', 'microsoft', 'outlook', 'hotmail', 'mailapi', 'yahoo']
 
 function isSupportedImportType(value: string): value is MailImportProviderType {
   return SUPPORTED_IMPORT_TYPES.includes(value as MailImportProviderType)
@@ -75,7 +76,9 @@ function isSupportedSelectionType(value: string): value is MailImportSelectionTy
 }
 
 function toImportApiType(value: MailImportSelectionType): MailImportProviderType {
-  return value === 'applemail' ? 'applemail' : 'microsoft'
+  if (value === 'applemail') return 'applemail'
+  if (value === 'yahoo') return 'yahoo'
+  return 'microsoft'
 }
 
 function resolveMicrosoftImportType(domain: string) {
@@ -129,6 +132,16 @@ function buildDisplayProviders(providers: MailImportProviderDescriptor[]) {
       continue
     }
 
+    if (provider.type === 'yahoo') {
+      items.push({
+        ...provider,
+        type: 'yahoo',
+        apiType: 'yahoo',
+        label: 'Yahoo（DEA 别名）',
+      })
+      continue
+    }
+
     items.push(
       {
         ...provider,
@@ -173,6 +186,7 @@ function matchesSelectionType(
 ) {
   const domain = String(email.split('@')[1] || '').trim().toLowerCase()
   const normalizedType = String(accountType || 'microsoft_oauth').trim().toLowerCase()
+  if (selectionType === 'yahoo') return true
   if (selectionType === 'mailapi') return normalizedType === 'mailapi_url'
   if (selectionType === 'hotmail') return normalizedType !== 'mailapi_url' && domain.includes('hotmail')
   if (selectionType === 'outlook') return normalizedType !== 'mailapi_url' && domain.includes('outlook')
@@ -232,6 +246,10 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   const [aliasSplitEnabled, setAliasSplitEnabled] = useState(false)
   const [aliasSplitCount, setAliasSplitCount] = useState(5)
   const [aliasIncludeOriginal, setAliasIncludeOriginal] = useState(false)
+  const [yahooEmail, setYahooEmail] = useState('')
+  const [yahooAppPassword, setYahooAppPassword] = useState('')
+  const [yahooSessionJson, setYahooSessionJson] = useState('')
+  const [yahooSessionFileName, setYahooSessionFileName] = useState('')
 
   const providerMap = useMemo(
     () => new Map(providers.map((provider) => [provider.type, provider])),
@@ -383,12 +401,50 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     }
   }
 
+  const handleYahooImport = async () => {
+    if (!yahooEmail.trim()) { message.error('请输入 Yahoo 邮箱'); return }
+    if (!yahooAppPassword.trim()) { message.error('请输入应用专用密码'); return }
+    if (!yahooSessionJson.trim()) { message.error('请上传 session.json 文件'); return }
+
+    setImporting(true)
+    try {
+      const response = await apiFetch('/mail-imports', {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'yahoo',
+          content: `${yahooEmail.trim()}----${yahooAppPassword.trim()}----${btoa(yahooSessionJson)}`,
+          enabled: true,
+        }),
+      }) as MailImportResult
+
+      setResult(response)
+      setRawSnapshot(response.snapshot)
+      if (response.summary.success > 0) {
+        setYahooEmail('')
+        setYahooAppPassword('')
+        setYahooSessionJson('')
+        setYahooSessionFileName('')
+        form.setFieldsValue({ mail_provider: 'yahoo' })
+      }
+      message.success(buildImportSuccessMessage(response))
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Yahoo 邮箱导入失败'
+      message.error(detail)
+    } finally {
+      setImporting(false)
+    }
+  }
+
   const handleTypeChange = (value: MailImportSelectionType) => {
     setSelectedType(value)
-    form.setFieldsValue({
-      mail_provider: 'mail_import',
-      mail_import_source: value === 'applemail' ? 'applemail' : 'microsoft',
-    })
+    if (value === 'yahoo') {
+      form.setFieldsValue({ mail_provider: 'yahoo' })
+    } else {
+      form.setFieldsValue({
+        mail_provider: 'mail_import',
+        mail_import_source: value === 'applemail' ? 'applemail' : 'microsoft',
+      })
+    }
   }
 
   const handleDelete = async (item: MailImportSnapshotItem) => {
@@ -639,69 +695,155 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
           </Form.Item>
         ) : null}
 
-        {supportsAliasSplit ? (
-          <div
-            style={{
-              border: '1px dashed rgba(127,127,127,0.35)',
-              borderRadius: 8,
-              padding: 12,
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 10,
-            }}
-          >
-            <Space align="center">
-              <Typography.Text strong>邮箱裂变（别名）</Typography.Text>
-              <Switch checked={aliasSplitEnabled} onChange={setAliasSplitEnabled} />
-              <Typography.Text type="secondary">
-                默认关闭；开启后每个原邮箱生成随机 6 位英文别名
-              </Typography.Text>
-            </Space>
-            {aliasSplitEnabled ? (
-              <Space align="center" wrap>
-                <Typography.Text>每个原邮箱裂变数量</Typography.Text>
-                <InputNumber
-                  min={1}
-                  max={5}
-                  value={aliasSplitCount}
-                  onChange={(value) => setAliasSplitCount(Math.max(1, Math.min(5, Number(value || 5))))}
+        {selectedType === 'yahoo' ? (
+          <>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div>
+                <Typography.Text strong>Yahoo 邮箱</Typography.Text>
+                <Input
+                  value={yahooEmail}
+                  onChange={(e) => setYahooEmail(e.target.value)}
+                  placeholder="user@yahoo.com"
+                  style={{ marginTop: 4 }}
                 />
-                <Typography.Text type="secondary">（1~5）</Typography.Text>
-                <Typography.Text style={{ marginLeft: 16 }}>包含原邮箱</Typography.Text>
-                <Switch checked={aliasIncludeOriginal} onChange={setAliasIncludeOriginal} />
+              </div>
+              <div>
+                <Typography.Text strong>应用专用密码</Typography.Text>
+                <Input.Password
+                  value={yahooAppPassword}
+                  onChange={(e) => setYahooAppPassword(e.target.value)}
+                  placeholder="在 Yahoo 账号安全设置中生成"
+                  style={{ marginTop: 4 }}
+                />
+              </div>
+              <div>
+                <Typography.Text strong>Session 文件</Typography.Text>
+                <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                  包含 wssid、mailbox_id、cookies 的 JSON 文件
+                </Typography.Text>
+                <div style={{ marginTop: 4 }}>
+                  <Upload
+                    accept=".json"
+                    maxCount={1}
+                    showUploadList={false}
+                    beforeUpload={(file) => {
+                      const reader = new FileReader()
+                      reader.onload = (e) => {
+                        const text = e.target?.result as string
+                        try {
+                          const parsed = JSON.parse(text)
+                          if (!parsed.wssid || !parsed.mailbox_id) {
+                            message.error('session.json 缺少 wssid 或 mailbox_id 字段')
+                            return
+                          }
+                          setYahooSessionJson(text)
+                          setYahooSessionFileName(file.name)
+                          message.success(`已读取 ${file.name}`)
+                        } catch {
+                          message.error('文件不是有效的 JSON 格式')
+                        }
+                      }
+                      reader.readAsText(file)
+                      return false
+                    }}
+                  >
+                    <Button icon={<UploadOutlined />}>
+                      {yahooSessionFileName ? `已选择: ${yahooSessionFileName}` : '上传 session.json'}
+                    </Button>
+                  </Upload>
+                </div>
+              </div>
+            </div>
+            <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+              <Button
+                danger
+                onClick={() => {
+                  setYahooEmail('')
+                  setYahooAppPassword('')
+                  setYahooSessionJson('')
+                  setYahooSessionFileName('')
+                  setResult(null)
+                }}
+              >
+                清空
+              </Button>
+              <Space>
+                <Button onClick={() => void loadSnapshot(selectedType)} loading={loadingSnapshot}>
+                  刷新预览
+                </Button>
+                <Button type="primary" onClick={handleYahooImport} loading={importing}>
+                  确认导入
+                </Button>
               </Space>
+            </Space>
+          </>
+        ) : (
+          <>
+            {supportsAliasSplit ? (
+              <div
+                style={{
+                  border: '1px dashed rgba(127,127,127,0.35)',
+                  borderRadius: 8,
+                  padding: 12,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 10,
+                }}
+              >
+                <Space align="center">
+                  <Typography.Text strong>邮箱裂变（别名）</Typography.Text>
+                  <Switch checked={aliasSplitEnabled} onChange={setAliasSplitEnabled} />
+                  <Typography.Text type="secondary">
+                    默认关闭；开启后每个原邮箱生成随机 6 位英文别名
+                  </Typography.Text>
+                </Space>
+                {aliasSplitEnabled ? (
+                  <Space align="center" wrap>
+                    <Typography.Text>每个原邮箱裂变数量</Typography.Text>
+                    <InputNumber
+                      min={1}
+                      max={5}
+                      value={aliasSplitCount}
+                      onChange={(value) => setAliasSplitCount(Math.max(1, Math.min(5, Number(value || 5))))}
+                    />
+                    <Typography.Text type="secondary">（1~5）</Typography.Text>
+                    <Typography.Text style={{ marginLeft: 16 }}>包含原邮箱</Typography.Text>
+                    <Switch checked={aliasIncludeOriginal} onChange={setAliasIncludeOriginal} />
+                  </Space>
+                ) : null}
+              </div>
             ) : null}
-          </div>
-        ) : null}
 
-        <Input.TextArea
-          value={content}
-          onChange={(event) => setContent(event.target.value)}
-          rows={10}
-          placeholder={selectedProvider?.content_placeholder || ''}
-          style={{ fontFamily: 'monospace' }}
-        />
+            <Input.TextArea
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+              rows={10}
+              placeholder={selectedProvider?.content_placeholder || ''}
+              style={{ fontFamily: 'monospace' }}
+            />
 
-        <Space style={{ width: '100%', justifyContent: 'space-between' }}>
-          <Button
-            danger
-            onClick={() => {
-              setContent('')
-              setFilename('')
-              setResult(null)
-            }}
-          >
-            清空
-          </Button>
-          <Space>
-            <Button onClick={() => void loadSnapshot(selectedType)} loading={loadingSnapshot}>
-              刷新预览
-            </Button>
-            <Button type="primary" onClick={handleImport} loading={importing}>
-              确认导入
-            </Button>
-          </Space>
-        </Space>
+            <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+              <Button
+                danger
+                onClick={() => {
+                  setContent('')
+                  setFilename('')
+                  setResult(null)
+                }}
+              >
+                清空
+              </Button>
+              <Space>
+                <Button onClick={() => void loadSnapshot(selectedType)} loading={loadingSnapshot}>
+                  刷新预览
+                </Button>
+                <Button type="primary" onClick={handleImport} loading={importing}>
+                  确认导入
+                </Button>
+              </Space>
+            </Space>
+          </>
+        )}
 
         {result ? (
           <Alert

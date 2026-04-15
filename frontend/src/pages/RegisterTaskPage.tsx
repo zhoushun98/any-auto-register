@@ -106,6 +106,8 @@ export default function RegisterTaskPage() {
         luckmail_api_key: cfg.luckmail_api_key || '',
         luckmail_email_type: cfg.luckmail_email_type || '',
         luckmail_domain: cfg.luckmail_domain || '',
+        yahoo_nickname_length: cfg.yahoo_nickname_length || '10',
+        yahoo_otp_timeout: cfg.yahoo_otp_timeout || '60',
       })
     })
   }, [form])
@@ -170,6 +172,8 @@ export default function RegisterTaskPage() {
       luckmail_api_key: values.luckmail_api_key,
       luckmail_email_type: values.luckmail_email_type,
       luckmail_domain: values.luckmail_domain,
+      yahoo_nickname_length: values.yahoo_nickname_length,
+      yahoo_otp_timeout: values.yahoo_otp_timeout,
       yescaptcha_key: values.yescaptcha_key,
       solver_url: values.solver_url,
     }
@@ -325,6 +329,7 @@ export default function RegisterTaskPage() {
                 { value: 'freemail', label: 'Freemail' },
                 { value: 'laoudo', label: 'Laoudo' },
                 { value: 'cfworker', label: 'CF Worker' },
+                { value: 'yahoo', label: 'Yahoo（DEA 别名）' },
               ]}
             />
           </Form.Item>

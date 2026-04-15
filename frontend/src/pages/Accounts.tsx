@@ -805,6 +805,8 @@ export default function Accounts() {
         luckmail_api_key: cfg.luckmail_api_key,
         luckmail_email_type: cfg.luckmail_email_type,
         luckmail_domain: cfg.luckmail_domain,
+        yahoo_nickname_length: cfg.yahoo_nickname_length,
+        yahoo_otp_timeout: cfg.yahoo_otp_timeout,
       }
       const chatgptRegistrationRequestAdapter =
         buildChatGPTRegistrationRequestAdapter(
