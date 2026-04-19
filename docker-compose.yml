@@ -1,11 +1,7 @@
 services:
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-135.0.1}
-        CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.24}
+    image: ${APP_IMAGE:-ghcr.io/zhoushun98/any-auto-register:latest}
+    pull_policy: always
     container_name: any-auto-register
     init: true
     restart: unless-stopped
