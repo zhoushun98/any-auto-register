@@ -175,24 +175,33 @@ Kiro 当前风控较严格，邮箱方案会显著影响成功率。当前项目
 
 ## 快速开始
 
-### 1. 创建并激活 Conda 环境
+### 1. 安装 uv（推荐 Python 包管理器）
+
+如未安装，请参考 [uv 官方安装文档](https://docs.astral.sh/uv/getting-started/installation/)：
 
 ```bash
-conda create -n any-auto-register python=3.12 -y
-conda activate any-auto-register
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-### 2. 安装后端依赖
+### 2. 同步后端依赖
+
+`uv sync` 会读取 `pyproject.toml` 和 `uv.lock`，自动安装 Python 3.12 并创建 `.venv/`：
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
+
+> 仓库仍保留 `requirements.txt`（由 `uv export` 自动生成），用于兼容 `pip install -r requirements.txt` 的老流程，但**新用户请使用 `uv sync`**。
 
 ### 3. 安装浏览器相关依赖
 
 ```bash
-python -m playwright install chromium
-python -m camoufox fetch
+uv run playwright install chromium
+uv run camoufox fetch
 ```
 
 ### 4. 安装并构建前端
@@ -229,8 +238,7 @@ start_backend.bat
 #### 手动启动
 
 ```bash
-conda activate any-auto-register
-python main.py
+uv run python main.py
 ```
 
 启动后默认访问：
@@ -250,7 +258,7 @@ http://localhost:8000
 - `stop_backend.bat`
 - `stop_backend.ps1`
 
-这些脚本会强制使用 `any-auto-register` 环境启动/停止后端，可避免以下常见问题：
+这些脚本会自动调用 `uv sync` 同步依赖再启动/停止后端，可避免以下常见问题：
 
 - 后端能启动，但 Solver 没有拉起
 - `ModuleNotFoundError: quart`
@@ -526,6 +534,8 @@ any-auto-register/
 ├── static/
 ├── tests/
 ├── main.py
+├── pyproject.toml
+├── uv.lock
 ├── requirements.txt
 ├── docker-compose.yml
 ├── Dockerfile

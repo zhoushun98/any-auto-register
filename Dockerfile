@@ -18,7 +18,9 @@ ARG CAMOUFOX_RELEASE=beta.24
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
     HOST=0.0.0.0 \
     PORT=8000 \
     APP_CONDA_ENV=docker \
@@ -32,7 +34,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt ./
+COPY pyproject.toml uv.lock .python-version ./
 COPY scripts/install_camoufox.py /tmp/install_camoufox.py
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -42,10 +44,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PATH="/usr/local/go/bin:/root/.local/bin:${PATH}"
+ENV PATH="/opt/venv/bin:/usr/local/go/bin:/root/.local/bin:${PATH}"
 
-RUN pip install --upgrade pip \
-    && pip install -r requirements.txt \
+RUN uv sync --frozen --no-install-project --no-dev \
     && installed=0 \
     && for attempt in 1 2 3; do \
          if python -m playwright install --with-deps chromium firefox; then \

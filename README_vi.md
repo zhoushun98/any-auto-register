@@ -165,24 +165,33 @@ Do đó khi đăng ký **Kiro (AWS Builder ID)**, khuyến nghị ưu tiên sử
 
 ## Bắt đầu nhanh
 
-### 1. Tạo và kích hoạt môi trường Conda
+### 1. Cài đặt uv (trình quản lý gói Python được khuyến nghị)
+
+Nếu chưa cài, tham khảo [tài liệu cài đặt uv chính thức](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```bash
-conda create -n any-auto-register python=3.12 -y
-conda activate any-auto-register
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-### 2. Cài đặt phụ thuộc backend
+### 2. Đồng bộ phụ thuộc backend
+
+`uv sync` sẽ đọc `pyproject.toml` và `uv.lock`, tự động cài đặt Python 3.12 và tạo `.venv/`:
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
+
+> Repo vẫn giữ `requirements.txt` (được sinh tự động bởi `uv export`) nhằm tương thích với luồng cũ `pip install -r requirements.txt`, nhưng **người dùng mới nên dùng `uv sync`**.
 
 ### 3. Cài đặt phụ thuộc trình duyệt
 
 ```bash
-python -m playwright install chromium
-python -m camoufox fetch
+uv run playwright install chromium
+uv run camoufox fetch
 ```
 
 ### 4. Cài đặt và build frontend
@@ -219,8 +228,7 @@ start_backend.bat
 #### Khởi động thủ công
 
 ```bash
-conda activate any-auto-register
-python main.py
+uv run python main.py
 ```
 
 Sau khi khởi động, truy cập mặc định:
@@ -240,7 +248,7 @@ Repo đã cung cấp các script sau:
 - `stop_backend.bat`
 - `stop_backend.ps1`
 
-Các script này bắt buộc sử dụng môi trường `any-auto-register` để khởi động/dừng backend, tránh các vấn đề thường gặp:
+Các script này sẽ chạy `uv sync` để đảm bảo phụ thuộc đã được cập nhật trước khi khởi động/dừng backend, tránh các vấn đề thường gặp:
 
 - Backend khởi động được nhưng Solver không chạy
 - `ModuleNotFoundError: quart`
@@ -516,6 +524,8 @@ any-auto-register/
 ├── static/
 ├── tests/
 ├── main.py
+├── pyproject.toml
+├── uv.lock
 ├── requirements.txt
 ├── docker-compose.yml
 ├── Dockerfile

@@ -7,11 +7,11 @@ BACKEND_DIR="$SCRIPT_DIR/../"
 
 cd "$BACKEND_DIR"
 
-echo "[1/3] 安装 PyInstaller..."
-pip install pyinstaller --quiet
+echo "[1/3] 同步依赖 (含 dev / PyInstaller)..."
+uv sync --quiet
 
 echo "[2/3] 打包后端..."
-pyinstaller --onefile --name backend \
+uv run pyinstaller --onefile --name backend \
   --add-data "platforms:platforms" \
   --add-data "core:core" \
   --add-data "api:api" \
